@@ -27,6 +27,11 @@ import dev.anydisplay.client.protocol.StreamConfig
 import dev.anydisplay.client.protocol.Transport
 import dev.anydisplay.client.protocol.VideoFrame
 import dev.anydisplay.client.protocol.Watchdog
+import dev.anydisplay.client.video.DecodeNegotiation
+import dev.anydisplay.client.video.DecodeRecovery
+import dev.anydisplay.client.video.DecodeRequestGate
+import dev.anydisplay.client.video.DecodeSize
+import dev.anydisplay.client.video.DecodeTarget
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
@@ -76,6 +81,13 @@ class Session(
         private set
     @Volatile var lastRequest: ConfigReq? = null
         private set
+
+    private val decodeLock = Any()
+    private val decodeNegotiation = DecodeNegotiation()
+    private val decodeRequests = DecodeRequestGate()
+    private var desiredRequest: ConfigReq? = null
+    val decoderId: Long? get() = synchronized(decodeLock) { decodeNegotiation.decoderId }
+    val decodeConfirmed: Boolean get() = synchronized(decodeLock) { decodeNegotiation.confirmed }
 
     val hostIsMac get() = hostOs.contains("mac", ignoreCase = true) || hostOs.contains("darwin", ignoreCase = true)
 
@@ -204,12 +216,26 @@ class Session(
             }
             Proto.CONFIG -> {
                 val c = StreamConfig.decode(f.body)
-                config = c
-                Elog.i("CONFIG $c")
-                SessionHub.update { it.copy(config = c) }
-                videoSink?.onConfig(c)
-                if (!c.audio) audio.release()
-                if (!c.clientCursor) { lastCursorPos = null; lastCursorShape = null }
+                synchronized(decodeLock) {
+                    if (!decodeRequests.response(decodeNegotiation.generation)) {
+                        Elog.i("ignore CONFIG ${c.streamId} from superseded request")
+                        sendCurrentRequestLocked()
+                        return
+                    }
+                    if (c == config && decodeNegotiation.isCurrent(c.streamId)) return
+                    if (c.width <= 0 || c.height <= 0 || !decodeNegotiation.accept(
+                            DecodeTarget(c.streamId, c.codec, DecodeSize(c.width, c.height)))) {
+                        fail("Host repeated a failed decoder size or sent an invalid configuration: ${c.width}x${c.height}")
+                        return
+                    }
+                    config = c
+                    Elog.i("CONFIG $c; decode attempt generation=${decodeNegotiation.generation}")
+                    SessionHub.update { it.copy(config = c) }
+                    val sink = videoSink
+                    if (sink == null) decodeNegotiation.suspend() else sink.onConfig(c)
+                    if (!c.audio) audio.release()
+                    if (!c.clientCursor) { lastCursorPos = null; lastCursorShape = null }
+                }
             }
             Proto.NOTICE -> {
                 val code = r.u16()
@@ -256,7 +282,8 @@ class Session(
     private fun onVideo(f: Frame) {
         val vf = try { VideoFrame.decode(f.body) } catch (e: Exception) { Elog.w("bad VIDEO_FRAME: ${e.message}"); return }
         val sink = videoSink
-        if (sink == null || config == null) {
+        val current = synchronized(decodeLock) { decodeNegotiation.isCurrent(vf.streamId) }
+        if (sink == null || !current) {
             ack(vf.streamId, vf.frameId, 0, rendered = false)
             return
         }
@@ -303,6 +330,13 @@ class Session(
 
     private fun tick() {
         try {
+            synchronized(decodeLock) {
+                if (decodeNegotiation.timedOut(SystemClock.elapsedRealtime())) {
+                    decodeNegotiation.target?.let {
+                        recoverDecodeLocked(it.streamId, "no decoded output within 5 seconds of video input", false)
+                    }
+                }
+            }
             send(Proto.CH_CONTROL, Proto.PING, Bodies.ping(pingSeq.getAndIncrement(), SystemClock.elapsedRealtimeNanos() / 1000))
             val decoded = framesDecoded.getAndSet(0)
             val dropped = framesDropped.getAndSet(0)
@@ -329,15 +363,66 @@ class Session(
 
     fun sendConfigRequest() {
         val req = DeviceCaps.configRequest(app, settings)
-        lastRequest = req
-        Elog.i("send $req")
-        send(Proto.CH_CONTROL, Proto.CONFIG_REQ, req.encode())
+        synchronized(decodeLock) { beginDecodeRequestLocked(req) }
     }
 
     /** Re-sends CONFIG_REQ only when the requested stream would change (rotation, settings). */
     fun refreshConfigRequest() {
         val req = DeviceCaps.configRequest(app, settings)
-        if (req != lastRequest) sendConfigRequest()
+        synchronized(decodeLock) {
+            if (req != desiredRequest) beginDecodeRequestLocked(req)
+        }
+    }
+
+    private fun beginDecodeRequestLocked(req: ConfigReq) {
+        val decoder = DeviceCaps.decoders()[req.codec]
+        desiredRequest = req
+        val size = decodeNegotiation.begin(DecodeSize(req.width, req.height),
+            { w, h -> decoder?.supports(w, h) ?: true },
+            decoder?.widthAlignment ?: 2, decoder?.heightAlignment ?: 2)
+        Elog.i("decode desired=${req.width}x${req.height} bounded=${size.width}x${size.height} generation=${decodeNegotiation.generation}")
+        sendCurrentRequestLocked()
+    }
+
+    private fun sendCurrentRequestLocked() {
+        if (ended || !decodeRequests.offer(decodeNegotiation.generation)) return
+        val size = decodeNegotiation.requested ?: return
+        val req = desiredRequest?.copy(width = size.width, height = size.height) ?: return
+        lastRequest = req
+        Elog.i("send $req")
+        send(Proto.CH_CONTROL, Proto.CONFIG_REQ, req.encode())
+    }
+
+    fun onDecoderStarting(source: VideoSink, streamId: Long, decoderId: Long): Boolean =
+        synchronized(decodeLock) {
+            videoSink === source && decodeNegotiation.decoderStarting(streamId, decoderId)
+        }
+
+    fun onDecodeInput(streamId: Long, decoderId: Long) {
+        synchronized(decodeLock) {
+            if (decodeNegotiation.input(streamId, SystemClock.elapsedRealtime(), decoderId)) {
+                Elog.i("decode first input stream=$streamId decoder=$decoderId; first-output deadline=5000ms")
+            }
+        }
+    }
+
+    fun onDecodeFailure(streamId: Long, decoderId: Long, reason: String, temporary: Boolean) {
+        synchronized(decodeLock) { recoverDecodeLocked(streamId, reason, temporary, decoderId) }
+    }
+
+    private fun recoverDecodeLocked(streamId: Long, reason: String, temporary: Boolean, decoderId: Long? = null) {
+        when (val action = decodeNegotiation.recover(streamId, reason, temporary, decoderId)) {
+            DecodeRecovery.Ignore -> Unit
+            is DecodeRecovery.Retry -> {
+                Elog.w("decode fallback stream=$streamId to ${action.size.width}x${action.size.height}: $reason")
+                SessionHub.notice(0, "Decoder retry: ${action.size.width}×${action.size.height} ($reason)")
+                sendCurrentRequestLocked()
+            }
+            is DecodeRecovery.Stop -> {
+                Elog.w("decode stopped stream=$streamId temporary=$temporary: ${action.reason}")
+                fail(action.reason)
+            }
+        }
     }
 
     fun requestKeyframe() = send(Proto.CH_CONTROL, Proto.KEYFRAME_REQ)
@@ -349,9 +434,15 @@ class Session(
     }
 
     /** FRAME_ACK after render or drop (PROTOCOL.md 5.2). */
-    fun ack(streamId: Long, frameId: Long, decodeUs: Long, rendered: Boolean, hostPtsUs: Long = 0) {
+    fun ack(streamId: Long, frameId: Long, decodeUs: Long, rendered: Boolean, hostPtsUs: Long = 0, decoderId: Long? = null) {
         send(Proto.CH_VIDEO, Proto.FRAME_ACK, Bodies.frameAck(streamId, frameId, decodeUs))
-        if (rendered) {
+        val currentOutput = synchronized(decodeLock) {
+            val first = !decodeNegotiation.confirmed
+            val accepted = rendered && decodeNegotiation.output(streamId, decoderId)
+            if (accepted && first) Elog.i("decode confirmed stream=$streamId size=${config?.width}x${config?.height}")
+            accepted
+        }
+        if (currentOutput) {
             framesDecoded.incrementAndGet()
             decodeUsSum.addAndGet(decodeUs)
             totalRendered.incrementAndGet()
@@ -367,15 +458,25 @@ class Session(
     }
 
     fun attachVideo(sink: VideoSink?) {
-        videoSink = sink
-        if (sink != null) {
-            config?.let { sink.onConfig(it) }
-            requestKeyframe()
+        synchronized(decodeLock) {
+            videoSink = sink
+            if (sink != null) {
+                config?.takeIf { decodeNegotiation.target?.streamId == it.streamId }?.let {
+                    decodeNegotiation.resume(it.streamId)
+                    sink.onConfig(it)
+                }
+                requestKeyframe()
+            } else decodeNegotiation.suspend()
         }
     }
 
     fun detachVideo(sink: VideoSink) {
-        if (videoSink === sink) videoSink = null
+        synchronized(decodeLock) {
+            if (videoSink === sink) {
+                videoSink = null
+                decodeNegotiation.suspend()
+            }
+        }
     }
 
     fun attachCursor(sink: CursorSink?) {
@@ -411,6 +512,7 @@ class Session(
     private fun finish() {
         ended = true
         connected = false
+        synchronized(decodeLock) { decodeNegotiation.suspend() }
         watchdog.close()
         scheduler?.shutdownNow()
         sender?.stop()

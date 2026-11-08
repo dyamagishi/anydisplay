@@ -85,6 +85,12 @@ The full wire format, handshake and key schedule are in [`docs/PROTOCOL.md`](doc
 
 ## Download
 
+### このフォークのAndroid版
+
+Androidデコーダーの申告サイズだけで事前に縮小せず、希望解像度の実デコードを確認し、失敗時に有限回の縮小再交渉を行います。機種名による特例は追加していません。仕組み・検証方法・確認範囲は [Android版の解像度交渉](docs/android-decoder-negotiation.md) を参照してください。
+
+開発ビルドは **AnyDisplay Dev**（`dev.anydisplay.client.dev`）として元アプリと別にインストールできます。以下の配布リンクは元プロジェクトのリリースで、このフォークの修正は含みません。
+
 | Download | For |
 |---|---|
 | [**AnyDisplay.apk**](https://github.com/efekurucay/anydisplay/releases/latest/download/AnyDisplay.apk) | The Android phone or tablet (Android 8.0+) |

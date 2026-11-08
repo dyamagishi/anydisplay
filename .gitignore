@@ -1,3 +1,4 @@
 tools/.venv/
 tools/.anydisplay_ref_*.json
 .DS_Store
+/artifacts/

@@ -33,6 +33,8 @@ data class DecoderChoice(
     private val caps: MediaCodecInfo.VideoCapabilities?,
 ) {
     fun supports(w: Int, h: Int): Boolean = caps?.isSizeSupported(w, h) ?: (w <= maxW && h <= maxH)
+    val widthAlignment: Int get() = caps?.widthAlignment ?: 2
+    val heightAlignment: Int get() = caps?.heightAlignment ?: 2
 }
 
 /** Everything DEVICE_INFO and CONFIG_REQ need to know about this device. */
@@ -172,16 +174,9 @@ object DeviceCaps {
     fun configRequest(context: Context, settings: Settings): ConfigReq {
         val codec = preferredCodec(settings)
         val (sw, sh) = streamScreenSize(context, settings.orientation)
-        var w = (sw * settings.scale).roundToInt() and 1.inv()
-        var h = (sh * settings.scale).roundToInt() and 1.inv()
-        val dec = decoders()[codec]
-        if (dec != null) {
-            var guard = 0
-            while (!dec.supports(w, h) && guard++ < 20) {
-                w = (w * 0.9f).roundToInt() and 1.inv()
-                h = (h * 0.9f).roundToInt() and 1.inv()
-            }
-        }
+        // The session tries this requested size before consulting capability tables for fallbacks.
+        val w = ((sw * settings.scale).roundToInt() and 1.inv()).coerceAtLeast(2)
+        val h = ((sh * settings.scale).roundToInt() and 1.inv()).coerceAtLeast(2)
         val hz = settings.refreshHz.coerceAtMost(maxOf(maxRefresh(context).roundToInt(), 30))
         var flags = 0
         if (settings.hidpi) flags = flags or Proto.FLAG_HIDPI

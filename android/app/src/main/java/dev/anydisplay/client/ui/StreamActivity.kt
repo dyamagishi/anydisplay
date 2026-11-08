@@ -309,13 +309,24 @@ class StreamActivity : BaseActivity(), SurfaceHolder.Callback, VideoDecoder.List
         d.release()
     }
 
-    override fun onAck(streamId: Long, frameId: Long, decodeUs: Long, rendered: Boolean, hostPtsUs: Long) {
-        session?.ack(streamId, frameId, decodeUs, rendered, hostPtsUs)
+    override fun onAck(streamId: Long, frameId: Long, decodeUs: Long, rendered: Boolean, hostPtsUs: Long, decoderId: Long) {
+        session?.ack(streamId, frameId, decodeUs, rendered, hostPtsUs, decoderId)
         if (rendered && waiting.visibility == View.VISIBLE) ui.post { waiting.visibility = View.GONE }
     }
 
     override fun onKeyframeNeeded() {
         session?.requestKeyframe()
+    }
+
+    override fun onDecoderStarting(source: VideoDecoder, streamId: Long, decoderId: Long): Boolean =
+        session?.onDecoderStarting(source, streamId, decoderId) ?: false
+
+    override fun onDecodeInput(streamId: Long, decoderId: Long) {
+        session?.onDecodeInput(streamId, decoderId)
+    }
+
+    override fun onDecodeFailure(streamId: Long, decoderId: Long, reason: String, temporary: Boolean) {
+        session?.onDecodeFailure(streamId, decoderId, reason, temporary)
     }
 
     override fun onDecoderStarted(name: String, config: StreamConfig) {

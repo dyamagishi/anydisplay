@@ -13,6 +13,7 @@ import dev.anydisplay.client.protocol.StreamConfig
 import dev.anydisplay.client.protocol.VideoFrame
 import dev.anydisplay.client.session.VideoSink
 import java.util.ArrayDeque
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Asynchronous MediaCodec decoder tuned for latency: every input is queued as soon as a buffer is free, every output
@@ -21,9 +22,12 @@ import java.util.ArrayDeque
  */
 class VideoDecoder(private val surface: Surface, private val listener: Listener) : VideoSink {
     interface Listener {
-        fun onAck(streamId: Long, frameId: Long, decodeUs: Long, rendered: Boolean, hostPtsUs: Long)
+        fun onAck(streamId: Long, frameId: Long, decodeUs: Long, rendered: Boolean, hostPtsUs: Long, decoderId: Long)
         fun onKeyframeNeeded()
         fun onDecoderStarted(name: String, config: StreamConfig)
+        fun onDecoderStarting(source: VideoDecoder, streamId: Long, decoderId: Long): Boolean
+        fun onDecodeInput(streamId: Long, decoderId: Long)
+        fun onDecodeFailure(streamId: Long, decoderId: Long, reason: String, temporary: Boolean)
     }
 
     private class Pending(val frame: VideoFrame, val receivedNanos: Long)
@@ -41,19 +45,26 @@ class VideoDecoder(private val surface: Surface, private val listener: Listener)
     private var needKeyframe = true
     private var lastKeyframeRequestMs = 0L
     private var released = false
+    private var recoveryAttempts = 0
+    private var decoderId = 0L
 
 
     @Volatile var decoderName = ""
         private set
 
     override fun onConfig(config: StreamConfig) {
-        handler.post { if (!released) start(config) }
+        handler.post {
+            if (!released) {
+                recoveryAttempts = 0
+                start(config)
+            }
+        }
     }
 
     override fun onFrame(frame: VideoFrame, receivedNanos: Long) {
         handler.post {
             if (released) {
-                listener.onAck(frame.streamId, frame.frameId, 0, false, frame.ptsUs)
+                listener.onAck(frame.streamId, frame.frameId, 0, false, frame.ptsUs, decoderId)
                 return@post
             }
             enqueue(Pending(frame, receivedNanos))
@@ -92,10 +103,11 @@ class VideoDecoder(private val surface: Surface, private val listener: Listener)
                 val pts = nextPts++
                 inFlight[pts] = InFlight(f.streamId, f.frameId, f.ptsUs, System.nanoTime())
                 c.queueInputBuffer(index, 0, f.dataLength, pts, 0)
+                listener.onDecodeInput(f.streamId, decoderId)
             } catch (e: Exception) {
                 Elog.w("queueInputBuffer failed: ${e.message}")
                 drop(f)
-                reset("input error")
+                recoverException(e, "input error")
                 return
             }
         }
@@ -117,7 +129,7 @@ class VideoDecoder(private val surface: Surface, private val listener: Listener)
             while (it.hasNext()) {
                 val e = it.next()
                 if (e.key < info.presentationTimeUs) {
-                    listener.onAck(e.value.streamId, e.value.frameId, 0, false, e.value.hostPtsUs)
+                    listener.onAck(e.value.streamId, e.value.frameId, 0, false, e.value.hostPtsUs, decoderId)
                     it.remove()
                 } else {
                     if (e.key == info.presentationTimeUs) { match = e.value; it.remove() }
@@ -132,14 +144,17 @@ class VideoDecoder(private val surface: Surface, private val listener: Listener)
                 if (render) c.releaseOutputBuffer(index, System.nanoTime()) else c.releaseOutputBuffer(index, false)
             } catch (e: Exception) {
                 Elog.w("releaseOutputBuffer failed: ${e.message}")
+                match?.let { listener.onAck(it.streamId, it.frameId, 0, false, it.hostPtsUs, decoderId) }
+                recoverException(e, "output release error")
+                return
             }
-            match?.let { listener.onAck(it.streamId, it.frameId, (now - it.queuedNanos) / 1000, render, it.hostPtsUs) }
+            match?.let { listener.onAck(it.streamId, it.frameId, (now - it.queuedNanos) / 1000, render, it.hostPtsUs, decoderId) }
         }
 
         override fun onError(c: MediaCodec, e: MediaCodec.CodecException) {
             if (c !== codec) return
             Elog.w("decoder error: ${e.diagnosticInfo} recoverable=${e.isRecoverable} transient=${e.isTransient}")
-            reset("codec error")
+            recoverException(e, "codec error")
         }
 
         override fun onOutputFormatChanged(c: MediaCodec, format: MediaFormat) {
@@ -150,9 +165,12 @@ class VideoDecoder(private val surface: Surface, private val listener: Listener)
     private fun start(cfg: StreamConfig) {
         stopCodec()
         config = cfg
+        decoderId = nextDecoderId.incrementAndGet()
+        if (!listener.onDecoderStarting(this, cfg.streamId, decoderId)) return
         val choice = DeviceCaps.decoders()[cfg.codec]
         val mime = DeviceCaps.mimeOf(cfg.codec)
         val attempts = listOf(true to true, false to true, false to false)
+        var lastError: Exception? = null
         for ((vendorKeys, tuning) in attempts) {
             var c: MediaCodec? = null
             try {
@@ -168,12 +186,33 @@ class VideoDecoder(private val surface: Surface, private val listener: Listener)
                 listener.onDecoderStarted(c.name, cfg)
                 return
             } catch (e: Exception) {
+                lastError = e
                 Elog.w("decoder configure failed (vendorKeys=$vendorKeys tuning=$tuning): ${e.message}")
                 codec = null
                 try { c?.release() } catch (_: Exception) {}
+                if (temporary(e)) {
+                    reportFailure("decoder resource failure: ${e.message}", true)
+                    return
+                }
             }
         }
         Elog.e("no decoder could be started for $mime ${cfg.width}x${cfg.height}")
+        reportFailure("cannot initialize $mime ${cfg.width}x${cfg.height}: ${lastError?.message}", false)
+    }
+
+    private fun temporary(e: Exception) = e is MediaCodec.CodecException &&
+        (e.isTransient || e.errorCode == MediaCodec.CodecException.ERROR_INSUFFICIENT_RESOURCE ||
+            e.errorCode == MediaCodec.CodecException.ERROR_RECLAIMED)
+
+    private fun recoverException(e: Exception, where: String) {
+        if (temporary(e)) reportFailure("$where: decoder resource failure: ${e.message}", true)
+        else reset("$where: ${e.message}")
+    }
+
+    private fun reportFailure(reason: String, temporary: Boolean) {
+        val cfg = config ?: return
+        stopCodec()
+        listener.onDecodeFailure(cfg.streamId, decoderId, reason, temporary)
     }
 
     private fun format(cfg: StreamConfig, mime: String, name: String, vendorKeys: Boolean, tuning: Boolean): MediaFormat {
@@ -206,9 +245,13 @@ class VideoDecoder(private val surface: Surface, private val listener: Listener)
     /** Drops queued work, restarts the codec, and asks the host for a keyframe. */
     private fun reset(why: String) {
         val cfg = config ?: return
+        if (recoveryAttempts++ >= 1) {
+            reportFailure("decoder failed after recovery: $why", false)
+            return
+        }
         Elog.i("decoder reset: $why")
         start(cfg)
-        requestKeyframe(force = true)
+        if (codec != null) requestKeyframe(force = true)
     }
 
     private fun requestKeyframe(force: Boolean = false) {
@@ -219,7 +262,7 @@ class VideoDecoder(private val surface: Surface, private val listener: Listener)
         }
     }
 
-    private fun drop(f: VideoFrame) = listener.onAck(f.streamId, f.frameId, 0, false, f.ptsUs)
+    private fun drop(f: VideoFrame) = listener.onAck(f.streamId, f.frameId, 0, false, f.ptsUs, decoderId)
 
     private fun stopCodec() {
         val c = codec
@@ -231,7 +274,7 @@ class VideoDecoder(private val surface: Surface, private val listener: Listener)
         freeInputs.clear()
         for (p in pending) drop(p.frame)
         pending.clear()
-        for (e in inFlight.values) listener.onAck(e.streamId, e.frameId, 0, false, e.hostPtsUs)
+        for (e in inFlight.values) listener.onAck(e.streamId, e.frameId, 0, false, e.hostPtsUs, decoderId)
         inFlight.clear()
     }
 
@@ -245,5 +288,9 @@ class VideoDecoder(private val surface: Surface, private val listener: Listener)
         }
         done.await(1, java.util.concurrent.TimeUnit.SECONDS)
         thread.quitSafely()
+    }
+
+    companion object {
+        private val nextDecoderId = AtomicLong()
     }
 }
